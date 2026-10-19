@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Downloaded pose models (fetched automatically on first run)
+*.task
+
+# Dance videos and everything extracted from them: large, and not ours to redistribute
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+output/
+
+# Photos of players
+photos/
