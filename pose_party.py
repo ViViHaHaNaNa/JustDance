@@ -5,18 +5,18 @@ Copy the stick figure in the top-right corner before the timer runs out.
 Hold the pose steady to lock in your best score for that round.
 
 Setup:
-    pip install opencv-python mediapipe numpy sounddevice
+    pip install -r requirements.txt
     python pose_party.py                              # random poses
     python pose_party.py --dance output/<folder>      # dance along to a song
-    python pose_party.py --dance output/<folder> --difficulty hard
 
 Dance mode plays a timeline made by extract_dance.py: the dancer (mirrored)
-on the left, you on the right with a ghost of the target pose on your body.
-You are scored on every beat against the pose the dancer struck a few seconds
-earlier (easy 2 s, medium 1.5 s, hard 0.3 s), best joint-angle match within
-+-0.3 s. Start screen: type your name, TAB = difficulty, ENTER = dance (a 3-2-1
-count-in waits until you stand inside the outline; SPACE skips that check).
-At the end you get a grade and a photo of your best moment saved in photos/.
+on the left, you on the right. You are scored against the dancer's pose right
+now (best joint-angle match within +-0.3 s). Key moves scroll along the bottom
+bar toward the hit zone, one every 2-3 s, and get rated OK / GOOD / PERFECT as
+they land; between moves, roughly matching the dancer earns small bonus points.
+Start screen: type your name, ENTER = dance (a 3-2-1 count-in waits until you
+stand inside the outline; SPACE skips that check). At the end you get a grade
+and a photo of your best moment saved in photos/.
 Result screen: R = replay, N = new player, Q = quit (20 s idle -> start screen).
 
 Keys:
@@ -26,6 +26,7 @@ Keys:
 """
 
 import argparse
+import json
 import os
 import random
 import time
@@ -497,15 +498,25 @@ def main():
 # Dance mode - play along with a timeline from extract_dance.py
 # --------------------------------------------------------------------------
 PANEL_H = 540        # height of each half of the split screen
-LOOKAHEAD = 0.7      # seconds past the scored pose for the faded "next pose" ghost
-WINDOW = 0.3         # a pose counts if you match it within +-this many seconds
-BEAT_HALF = 0.15     # each beat is rated on the frames within +-this of it
-MIN_SCORED = 0.5     # a beat is only rated if this much of it was scorable
-BEAT_FEEDBACK = 0.45 # how long the rating text stays up (beats come ~0.6 s apart)
-HINTS = 3            # upcoming poses shown in the corner strip
-# How many seconds late you copy the dancer: you're scored against the pose
-# the dancer struck this long ago, so easy leaves more time to follow along.
-DIFFICULTY = {"easy": 2.0, "medium": 1.5, "hard": 0.3}
+WINDOW = 0.3         # you match the dancer if you hit their pose within +-this many seconds
+BAR_H = 190          # height of the move bar under the two panels
+BAR_SECONDS = 6.0    # how far ahead the bar looks
+HIT_X = 120          # x of the hit zone on the bar
+APPROACH = 3.0       # the ring closes in and the 3-2-1 runs for this long before a move
+MOVE_FADE = 0.5      # a landed move slides off the left of the bar for this long
+MOVE_BEFORE = 0.2    # a move is rated on your best frames from this long before...
+MOVE_AFTER = 0.1     # ...to this long after it lands
+MOVE_FEEDBACK = 0.8  # how long OK / GOOD / PERFECT stays up
+# Standing still shouldn't score: over the last second, if the dancer moved this much
+# (average range of their joint angles, degrees) and you moved much less, the match is
+# scaled down. A static pose happens to resemble some frame of almost any dance.
+STILL_WINDOW = 1.0
+STILL_DANCER_MIN = 10.0
+STILL_FLOOR = 0.4    # a completely still player keeps this fraction of their match
+BONUS_MATCH = 0.5    # between moves, matching the dancer at least this well earns bonus
+BONUS_EVERY = 0.25   # ...one bonus every this many seconds of matching
+BONUS_POINTS = 10
+BONUS_CLEAR = 0.5    # no bonus this close to a move (those are rated instead)
 LIMB_TOLERANCE = 60  # degrees off at which a limb turns fully red
 # Compare 2D screen angles (like the classic game) or the timeline's 3D world
 # angles. MediaPipe's 3D estimates are noisier, even a perfect copy of the
@@ -519,11 +530,6 @@ LIMB_ANGLE = {
     ("Lhip", "Lknee"): "Lhip", ("Lknee", "Lankle"): "Lknee",
     ("Rhip", "Rknee"): "Rhip", ("Rknee", "Rankle"): "Rknee",
 }
-CHAINS = [("Lshoulder", "Lelbow", "Lwrist"), ("Rshoulder", "Relbow", "Rwrist"),
-          ("Lhip", "Lknee", "Lankle"), ("Rhip", "Rknee", "Rankle")]
-TORSO = ("Lshoulder", "Rshoulder", "Lhip", "Rhip")
-GHOST_COLOR = (255, 255, 255)
-NEXT_COLOR = (255, 200, 80)
 
 
 def flip_name(name):
@@ -611,6 +617,7 @@ class Timeline:
         self.duration = self.n / self.fps
         self.tracked = d["tracked"]
         src_w, src_h = d["frame_size"] if "frame_size" in d.files else (1920, 1080)
+        self.aspect = src_w / src_h
         self.img = d["image"] / np.array([src_w, src_h])  # normalised 0..1
         self.img[..., 0] = 1.0 - self.img[..., 0]
         self.joints = [flip_name(str(j)) for j in d["joint_names"]]
@@ -623,6 +630,16 @@ class Timeline:
             for k, (a, b, c) in enumerate(ANGLES[name] for name in self.angle_names):
                 for f in np.flatnonzero(~np.isnan(self.angles[:, k])):
                     self.angles[f, k] = joint_angle(px[f, j[a]], px[f, j[b]], px[f, j[c]])
+        # Shoulder width / torso length: collapses to a line when the dancer turns side-on
+        pts2 = self.img * [self.aspect, 1.0]
+        ix = {k: n for n, k in enumerate(self.joints)}
+        torso = np.linalg.norm((pts2[:, ix["Lshoulder"]] + pts2[:, ix["Rshoulder"]]) / 2
+                               - (pts2[:, ix["Lhip"]] + pts2[:, ix["Rhip"]]) / 2, axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            self.shoulder_ratio = (np.linalg.norm(pts2[:, ix["Lshoulder"]]
+                                                  - pts2[:, ix["Rshoulder"]], axis=1) / torso)
+        self.shoulder_ratio[~self.tracked] = np.nan
+        self.moves = load_moves(self, folder)
 
     def index(self, t):
         return int(np.clip(round(t * self.fps), 0, self.n - 1))
@@ -701,34 +718,6 @@ class VideoPanel:
         return self.frame
 
 
-def fit_ghost(target, player):
-    """Hang the target's limbs off the player's own shoulders and hips.
-
-    Limb directions come from the target and lengths are scaled by torso
-    size, so the ghost sits on your body and shows where each limb should go.
-    """
-    if not all(k in target for k in TORSO) or not all(k in player for k in TORSO):
-        return None
-
-    def torso(p):
-        sh = (p["Lshoulder"] + p["Rshoulder"]) / 2
-        return np.linalg.norm(sh - (p["Lhip"] + p["Rhip"]) / 2), sh
-
-    t_len, t_sh = torso(target)
-    p_len, p_sh = torso(player)
-    if t_len < 1:
-        return None
-    scale = p_len / t_len
-    ghost = {k: player[k] for k in TORSO}
-    if "head" in target:
-        ghost["head"] = p_sh + (target["head"] - t_sh) * scale
-    for chain in CHAINS:
-        for a, b in zip(chain, chain[1:]):
-            if a in ghost and a in target and b in target:
-                ghost[b] = ghost[a] + (target[b] - target[a]) * scale
-    return ghost
-
-
 def ipt(p):
     return tuple(int(v) for v in p)
 
@@ -740,14 +729,6 @@ def draw_skeleton(img, pts, color_of, thick, head=True):
     if head and "head" in pts and "Lshoulder" in pts and "Rshoulder" in pts:
         r = max(8, int(np.linalg.norm(pts["Lshoulder"] - pts["Rshoulder"]) * 0.3))
         cv2.circle(img, ipt(pts["head"]), r, color_of("head", "head"), thick, cv2.LINE_AA)
-
-
-def draw_ghost(img, pts, color, alpha, thick):
-    if not pts:
-        return
-    layer = img.copy()
-    draw_skeleton(layer, pts, lambda a, b: color, thick)
-    cv2.addWeighted(layer, alpha, img, 1 - alpha, 0, img)
 
 
 def limb_color(errs):
@@ -783,13 +764,186 @@ def dance_score(player, tl, tt):
     return best, best_j
 
 
+TURN_RATIO = 0.24    # shoulders this narrow (shoulder width / torso length) = turned side-on
+
+
+def pose_extent(p):
+    """How far the wrists reach from the body, in torso lengths (0 = arms tucked in)."""
+    need = ("Lshoulder", "Rshoulder", "Lhip", "Rhip", "Lwrist", "Rwrist")
+    if not all(k in p for k in need):
+        return 0.0
+    sh = (p["Lshoulder"] + p["Rshoulder"]) / 2
+    torso = np.linalg.norm(sh - (p["Lhip"] + p["Rhip"]) / 2)
+    if torso < 1e-6:
+        return 0.0
+    return float(max(np.linalg.norm(p[w] - sh) for w in ("Lwrist", "Rwrist")) / torso)
+
+
+def classify_pose(p, angles=None, return_all=False, min_clarity=0.35):
+    """(label, clarity 0..1) for a pose given as screen-side joint points
+    (mirrored, y down), or (None, 0) when it is just standing around.
+
+    Labels use the player's own sides: in the mirrored view, "Left" is the
+    left of the screen, which is your left arm when you copy it. Turning around
+    is handled separately, from how narrow the shoulders get (see pick_key_moves).
+    """
+    need = ("Lshoulder", "Rshoulder", "Lhip", "Rhip", "Lwrist", "Rwrist")
+    if not all(k in p for k in need):
+        return None, 0.0
+    sh, hp = (p["Lshoulder"] + p["Rshoulder"]) / 2, (p["Lhip"] + p["Rhip"]) / 2
+    torso = np.linalg.norm(sh - hp)
+    if torso < 1e-6:
+        return None, 0.0
+    ramp = lambda x, lo, hi: float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
+
+    arm = {}
+    for side, out_sign in (("L", -1), ("R", 1)):
+        w, s_ = p[side + "wrist"], p[side + "shoulder"]
+        dy = (w[1] - s_[1]) / torso                     # < 0: above the shoulder
+        out = out_sign * (w[0] - s_[0]) / torso         # > 0: away from the body
+        elbow_out = (out_sign * (p[side + "elbow"][0] - s_[0]) / torso
+                     if side + "elbow" in p else 0.0)
+        hip_dy = abs(w[1] - p[side + "hip"][1]) / torso
+        arm[side] = {
+            "up": ramp(-dy, 0.35, 0.8),                 # hand clearly above the shoulder
+            "out": min(ramp(out, 0.5, 0.9), 1 - ramp(abs(dy), 0.4, 0.8)),
+            "hip": min(1 - ramp(hip_dy, 0.2, 0.45), ramp(elbow_out, 0.25, 0.5)),
+        }
+    L, R = arm["L"], arm["R"]
+    cands = {
+        "Arms up": min(L["up"], R["up"]),
+        "Arms out": min(L["out"], R["out"]),
+        "Hips": min(L["hip"], R["hip"]),
+        "Left up": L["up"] * (1 - R["up"]) * 0.9,
+        "Right up": R["up"] * (1 - L["up"]) * 0.9,
+        "Left out": L["out"] * (1 - R["out"]) * 0.9,
+        "Right out": R["out"] * (1 - L["out"]) * 0.9,
+    }
+    wd = np.linalg.norm(p["Lwrist"] - p["Rwrist"]) / torso
+    mid_y = (((p["Lwrist"] + p["Rwrist"]) / 2)[1] - sh[1]) / torso
+    # Hands brought together in front of the body: easy to confuse with half a dozen
+    # other gestures, so it only wins when nothing clearer is going on
+    cands["Clap"] = min(1 - ramp(wd, 0.2, 0.45), ramp(mid_y, -0.1, 0.2),
+                        1 - ramp(mid_y, 0.7, 1.0)) * 0.6
+    lean = (sh[0] - hp[0]) / torso  # < 0: leaning to the screen-left
+    cands["Lean left" if lean < 0 else "Lean right"] = ramp(abs(lean), 0.15, 0.35) * 0.85
+    if angles and "Lknee" in angles and "Rknee" in angles:
+        cands["Squat"] = ramp(150 - (angles["Lknee"] + angles["Rknee"]) / 2, 15, 45) * 0.8
+    if return_all:
+        return cands
+    label = max(cands, key=cands.get)
+    return (label, cands[label]) if cands[label] > min_clarity else (None, 0.0)
+
+
+def pick_key_moves(tl, first=2.0, gap=(1.9, 3.1), max_gap=4.5):
+    """Key moves for the bar: clear, distinct poses on the beat, every 2-3 s.
+
+    Each move is {"t", "label", "kind", "pts"}; pts is the pose for the pictogram.
+    Candidates are beats where the dancer is tracked throughout. If the shoulders
+    close up to a line near the beat the dancer is turning, and it's a "Turn" (arm
+    positions are meaningless mid-turn, which is what used to turn these into "Left
+    up" or "Clap"). Otherwise the pose has to read as something nameable; we take the
+    clearest frame within 0.1 s of the beat, and prefer big, held poses over arms
+    tucked in or mid-swing.
+    """
+    times = tl.beats if len(tl.beats) else np.arange(0.0, tl.duration, 0.1)
+    tracked_t = np.flatnonzero(tl.tracked)
+    if not len(tracked_t):
+        return []
+    span = int(WINDOW * tl.fps)
+    near = max(1, int(0.1 * tl.fps))
+    step = max(1, int(0.03 * tl.fps))
+    speed = np.nan_to_num(np.abs(np.diff(tl.angles, axis=0)), nan=0.0).mean(axis=1) * tl.fps
+
+    cands = []
+    for b in times:
+        i = tl.index(b)
+        lo, hi = max(i - span, 0), i + span + 1
+        if b > tl.duration - 0.5 or not tl.tracked[lo:hi].all():
+            continue
+        win = tl.shoulder_ratio[lo:hi]
+        if np.isfinite(win).any() and np.nanmin(win) < TURN_RATIO:
+            j = lo + int(np.nanargmin(win))
+            cands.append((float(b), "Turn", 0.9, j))
+            continue
+        best = None
+        for j in range(max(i - near, 0), i + near + 1, step):
+            label, clarity = classify_pose(tl.points_at(j, tl.aspect, 1.0),
+                                           tl.angles_at(j), min_clarity=0.2)
+            if label and (best is None or clarity > best[1]):
+                best = (label, clarity, j)
+        if best is None:
+            continue
+        label, clarity, j = best
+        extent = pose_extent(tl.points_at(j, tl.aspect, 1.0))
+        motion = speed[max(i - span // 2, 0):i + span // 2 + 1].mean()
+        score = clarity + 0.3 * min(extent / 1.5, 1.0) - 0.5 * min(motion / 300.0, 1.0)
+        cands.append((float(b), label, score, j))
+
+    moves, last = [], tracked_t[0] / tl.fps + first - gap[1]
+    while True:
+        window = gap[1]
+        pool = []
+        while not pool and window <= max_gap:
+            pool = [c for c in cands if last + gap[0] <= c[0] <= last + window]
+            window += 0.5
+        if not pool:
+            later = [c for c in cands if c[0] > last + max_gap]
+            if not later:
+                break
+            last = later[0][0] - gap[1]  # nothing nameable for a while: skip ahead
+            continue
+        prev = moves[-1]["label"] if moves else None
+        t, label, score, j = max(pool, key=lambda c: c[2] + (0.3 if c[1] != prev else 0.0))
+        moves.append({"t": t, "label": label, "kind": "turn" if label == "Turn" else "pose",
+                      "pts": tl.points_at(j, tl.aspect, 1.0)})
+        last = t
+    return moves
+
+
+def load_moves(tl, folder):
+    """The song's key moves: moves.json if the folder has one (so a person can fix
+    or add moves by hand), else picked automatically. moves.json is a list of
+    {"t": seconds, "label": "Arms up"}; a label of "Turn" makes it a turn."""
+    path = os.path.join(folder, "moves.json")
+    if not os.path.exists(path):
+        return pick_key_moves(tl)
+    with open(path, encoding="utf-8") as f:
+        raw = sorted(json.load(f), key=lambda e: e["t"])
+    moves = []
+    for e in raw:
+        t, label = float(e["t"]), str(e["label"])
+        i = tl.index(t)
+        turn = label.lower() == "turn"
+        if turn:  # the pictogram is the narrowest moment around it
+            lo, hi = tl.index(t - WINDOW), tl.index(t + WINDOW) + 1
+            win = tl.shoulder_ratio[lo:hi]
+            if np.isfinite(win).any():
+                i = lo + int(np.nanargmin(win))
+        moves.append({"t": t, "label": label, "kind": "turn" if turn else "pose",
+                      "pts": tl.points_at(i, tl.aspect, 1.0)})
+    return moves
+
+
+def export_moves(folder):
+    """Write the automatically picked moves to moves.json to edit by hand."""
+    path = os.path.join(folder, "moves.json")
+    if os.path.exists(path):
+        raise SystemExit(f"{path} already exists; delete it first to export fresh moves.")
+    moves = pick_key_moves(Timeline(folder))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([{"t": round(m["t"], 2), "label": m["label"]} for m in moves], f, indent=1)
+    print(f"Wrote {len(moves)} moves to {path}. Edit labels or times, delete lines you "
+          f"don't like, and the game will use that list.")
+
+
 PHOTO_DIR = "photos"
 RESULT_TIMEOUT = 20.0   # seconds on the result screen before going back to idle
 NAME_MAX = 12
 FX_TIME = 0.4           # how long the hit effect lasts
 # Grade = 70% average accuracy + 30% how much of the song the best streak covered
-GRADES = [("S", 0.68, (0, 215, 255)), ("A", 0.52, (90, 230, 90)),
-          ("B", 0.38, (255, 190, 70)), ("C", 0.00, (110, 110, 255))]
+GRADES = [("S", 0.60, (0, 215, 255)), ("A", 0.46, (90, 230, 90)),
+          ("B", 0.36, (255, 190, 70)), ("C", 0.00, (110, 110, 255))]
 
 
 def grade_for(avg_match, best_combo, judged):
@@ -798,17 +952,27 @@ def grade_for(avg_match, best_combo, judged):
     return next((g, c) for g, th, c in GRADES if value >= th)
 
 
+TURN_BEFORE, TURN_AFTER = 0.5, 0.4   # a turn is rated on your narrowest shoulders in this window
+LEADERBOARD_SIZE = 20
+
+
 class DanceGame:
-    def __init__(self, beats=()):
-        self.beats = np.asarray(beats, float)
+    """Score, combo and ratings. Key moves are rated when they land; between
+    moves, roughly matching the dancer earns small bonus points."""
+
+    def __init__(self, moves=()):
+        self.move_times = np.array([m["t"] for m in moves], float)
+        self.move_turn = [m.get("kind") == "turn" for m in moves]
         self.reset()
 
     def reset(self):
-        self.score = self.combo = self.best_combo = self.gained = 0
+        self.score = self.bonus = self.combo = self.best_combo = self.gained = 0
         self.counts = {r[0]: 0 for r in RATINGS}
-        self.matches = []  # match 0..1 of every rated beat
-        self.samples = deque()  # (song time, match or None) of recent frames
-        self.beat_i = 0
+        self.matches = []  # match 0..1 of every move that has landed
+        self.samples = deque()  # (song time, match or None, shoulder ratio or None)
+        self.move_i = 0
+        self.last_move = None  # (time, is_turn) of the move that landed last
+        self.last_t, self.bonus_clock, self.bonus_t = None, 0.0, -1e9
         self.rating, self.rating_t = None, -1e9
         self.done = False
 
@@ -819,22 +983,51 @@ class DanceGame:
     def grade(self):
         return grade_for(self.accuracy, self.best_combo, len(self.matches))
 
-    def update(self, t, live):
-        """live = match 0..1 this frame, or None if the frame isn't scored.
-        Rates each beat once BEAT_HALF has passed it; True if one was rated."""
-        self.samples.append((t, live))
-        rated = False
-        while self.beat_i < len(self.beats) and t >= self.beats[self.beat_i] + BEAT_HALF:
-            b = self.beats[self.beat_i]
-            self.beat_i += 1
-            near = [m for tt, m in self.samples if abs(tt - b) <= BEAT_HALF]
-            scored = [m for m in near if m is not None]
-            if scored and len(scored) >= MIN_SCORED * len(near):
-                self._judge(float(np.mean(scored)), t)
-                rated = True
-        while self.samples and self.samples[0][0] < t - 4 * BEAT_HALF:
+    def update(self, t, live, ratio=None):
+        """live = match 0..1 this frame, or None if it isn't scored (dancer lost,
+        or your arms aren't visible). ratio = your shoulder width / torso length
+        (for turns), None if you aren't in view. Returns True if a move landed."""
+        self.samples.append((t, live, ratio))
+        dt = 0.0 if self.last_t is None else min(t - self.last_t, 0.1)
+        self.last_t = t
+
+        landed = False
+        while self.move_i < len(self.move_times):
+            m, turn = self.move_times[self.move_i], self.move_turn[self.move_i]
+            if t < m + (TURN_AFTER if turn else MOVE_AFTER):
+                break
+            self.move_i += 1
+            if turn:  # rated on how narrow your shoulders got: turned side-on = 0.3 or less
+                rs = [r for tt, _, r in self.samples
+                      if m - TURN_BEFORE <= tt <= m + TURN_AFTER and r is not None]
+                value = float(np.clip((0.6 - min(rs)) / 0.3, 0.0, 1.0)) if rs else 0.0
+            else:
+                # Unscored frames count as 0 here: hiding from the camera can't dodge a move
+                near = [v or 0.0 for tt, v, _ in self.samples
+                        if m - MOVE_BEFORE <= tt <= m + MOVE_AFTER]
+                smooth = (np.convolve(near, np.ones(5) / 5, "valid") if len(near) >= 5
+                          else [np.mean(near)] if near else [0.0])
+                value = float(np.max(smooth))
+            self._judge(value, t)
+            self.last_move = (float(m), turn)
+            landed = True
+        while self.samples and self.samples[0][0] < t - 1.5:
             self.samples.popleft()
-        return rated
+
+        # Bonus between moves: keep matching the dancer, collect points as you go
+        k = np.searchsorted(self.move_times, t)
+        gap = min((abs(self.move_times[j] - t) for j in (k - 1, k)
+                   if 0 <= j < len(self.move_times)), default=1e9)
+        if live is not None and live >= BONUS_MATCH and gap > BONUS_CLEAR:
+            self.bonus_clock += dt
+            if self.bonus_clock >= BONUS_EVERY:
+                self.bonus_clock -= BONUS_EVERY
+                self.score += BONUS_POINTS
+                self.bonus += BONUS_POINTS
+                self.bonus_t = t
+        else:
+            self.bonus_clock = 0.0
+        return landed
 
     def _judge(self, match, t):
         name, points = next((n, p) for n, th, p, _ in RATINGS if match >= th)
@@ -848,6 +1041,61 @@ class DanceGame:
             self.best_combo = max(self.best_combo, self.combo)
             self.gained = int(points * (1 + 0.1 * (self.combo - 1)))
             self.score += self.gained
+
+
+# --------------------------------------------------------------------------
+# Leaderboard: one leaderboard.json per song folder
+# --------------------------------------------------------------------------
+def load_board(folder):
+    try:
+        with open(os.path.join(folder, "leaderboard.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def add_to_board(folder, entry):
+    """Add a score; returns its rank (1 = top) or None if it didn't make the board."""
+    board = load_board(folder)
+    board.append(entry)
+    board.sort(key=lambda e: (-e["score"], e["date"]))
+    rank = board.index(entry) + 1
+    try:
+        with open(os.path.join(folder, "leaderboard.json"), "w", encoding="utf-8") as f:
+            json.dump(board[:LEADERBOARD_SIZE], f, indent=1)
+    except OSError:
+        pass
+    return rank if rank <= LEADERBOARD_SIZE else None
+
+
+def put_right(img, text, x, y, scale=0.6, color=(255, 255, 255), thick=1):
+    """put() with the text ending at x instead of starting there."""
+    (tw, _), _ = cv2.getTextSize(text, FONT, scale, thick)
+    put(img, text, (x - tw, y), scale, color, thick)
+
+
+def draw_board(img, x, y, board, mark=None, rows=5, width=420, scale=0.6):
+    """Top `rows` scores at (x, y); `mark` = 0-based rank to highlight (it is added
+    as an extra line if it fell below the visible rows)."""
+    gold = (0, 215, 255)
+    put(img, "LEADERBOARD", (x, y), 0.7, gold, 2)
+    if not board:
+        put(img, "no scores yet", (x, y + 40), scale, (170, 170, 170), 1)
+        return
+    shown = list(range(min(rows, len(board))))
+    if mark is not None and mark >= rows:
+        shown.append(mark)
+    for r, k in enumerate(shown):
+        e, yy = board[k], y + 38 + r * int(scale * 56)
+        hl = k == mark
+        if hl:
+            cv2.rectangle(img, (x - 10, yy - int(scale * 36)), (x + width, yy + int(scale * 12)),
+                          (80, 55, 40), -1)
+        color = gold if hl else (235, 235, 235)
+        put(img, f"{k + 1}.", (x, yy), scale, color, 1)
+        put(img, str(e["name"])[:NAME_MAX].upper(), (x + 50, yy), scale, color, 2 if hl else 1)
+        put_right(img, str(e["score"]), x + width - 50, yy, scale, color, 1)
+        put_right(img, str(e.get("grade", "")), x + width - 8, yy, scale, color, 2)
 
 
 def draw_fx(cam, fx, t):
@@ -903,21 +1151,124 @@ def save_photo(img, name):
     return path if cv2.imwrite(path, img) else None
 
 
-def draw_mini(img, pts, box, color):
-    """Small stick figure of `pts`, scaled to fit box=(x0,y0,x1,y1)."""
+# Clean, iconic pictograms for the standard move labels, like the game's own: a
+# mannequin with the arms set to the pose, instead of the raw (noisy) keypoints.
+# Units are torso lengths from the shoulder line, x right, y down; arm entries are
+# (elbow, wrist) for the screen-LEFT arm and get mirrored for the right one.
+ICON_ARMS = {
+    "down": ((-0.10, 0.24), (-0.14, 0.48)),
+    "up": ((-0.17, -0.26), (-0.12, -0.52)),
+    "out": ((-0.25, 0.0), (-0.50, 0.0)),
+    "hip": ((-0.30, 0.20), (-0.11, 0.48)),
+    "clap": ((-0.20, 0.22), (-0.03, 0.14)),
+}
+# label -> (left arm, right arm, lean degrees (+ = to the screen-right), legs, narrow)
+ICONS = {
+    "Arms up": ("up", "up"), "Arms out": ("out", "out"), "Hips": ("hip", "hip"),
+    "Clap": ("clap", "clap"),
+    "Left up": ("up", "down"), "Right up": ("down", "up"),
+    "Left out": ("out", "down"), "Right out": ("down", "out"),
+    "Lean left": ("down", "down", -26), "Lean right": ("down", "down", 26),
+    "Squat": ("down", "down", 0, True),
+    "Turn": ("clap", "clap", 0, False, True),
+}
+
+
+def draw_icon(img, label, box, arm_color=(0, 215, 255), body_color=(240, 240, 240)):
+    """Draw the standard pictogram for `label` into box=(x0,y0,x1,y1).
+    Returns False if the label has no standard icon (custom moves)."""
+    spec = ICONS.get(label)
+    if spec is None:
+        return False
+    left, right = spec[0], spec[1]
+    lean = np.radians(spec[2]) if len(spec) > 2 else 0.0
+    legs = len(spec) > 3 and spec[3]
+    narrow = len(spec) > 4 and spec[4]
+
+    sw = 0.05 if narrow else 0.17             # half shoulder width (side-on when turning)
+    shoulders = {"L": np.array([-sw, 0.0]), "R": np.array([sw, 0.0])}
+    hips = {"L": np.array([-0.09 if not narrow else -0.03, 0.5]),
+            "R": np.array([0.09 if not narrow else 0.03, 0.5])}
+    pts = {"headc": np.array([0.0, -0.22]), "sL": shoulders["L"], "sR": shoulders["R"]}
+    for side, name in (("L", left), ("R", right)):
+        elbow, wrist = (np.array(a) for a in ICON_ARMS[name])
+        if side == "R":  # the arm table is for the left arm: mirror it
+            elbow, wrist = elbow * [-1, 1], wrist * [-1, 1]
+        if narrow:  # side-on: arms swing forward, close to the body
+            elbow, wrist = elbow * [0.3, 1], wrist * [0.3, 1]
+        pts["e" + side], pts["w" + side] = shoulders[side] + elbow, shoulders[side] + wrist
+
+    # Leaning tips everything above the hips around the hip centre
+    pivot = np.array([0.0, 0.5])
+    c, s = np.cos(lean), np.sin(lean)
+    rot = lambda p: pivot + np.array([c * (p[0] - pivot[0]) - s * (p[1] - pivot[1]),
+                                      s * (p[0] - pivot[0]) + c * (p[1] - pivot[1])])
+    for k in list(pts):
+        pts[k] = rot(pts[k])
+
+    if legs:   # squat: knees out and forward, shorter stance
+        knees = {"L": np.array([-0.30, 0.82]), "R": np.array([0.30, 0.82])}
+        ankles = {"L": np.array([-0.17, 1.15]), "R": np.array([0.17, 1.15])}
+        bottom = 1.2
+    else:      # standing: thighs only, so the arms get the room
+        knees = {"L": hips["L"] + [-0.01, 0.38], "R": hips["R"] + [0.01, 0.38]}
+        ankles = None
+        bottom = 0.95
     x0, y0, x1, y1 = box
+    # One scale for every icon (so they look alike in size): sized so hands-up and
+    # arms-out both fit
+    top = -0.68
+    scale = min((x1 - x0) / 1.25, (y1 - y0) / (bottom - top))
+    mid = np.array([(x0 + x1) / 2, (y0 + y1) / 2])
+    centre = np.array([0.0, (top + bottom) / 2])
+    P = lambda p: tuple(int(v) for v in (np.asarray(p) - centre) * scale + mid)
+    thick = max(3, int(scale * 0.075))
+
+    line = lambda a, b, col, t=thick: cv2.line(img, P(a), P(b), col, t, cv2.LINE_AA)
+    for side in "LR":
+        line(hips[side], knees[side], body_color)
+        if ankles:
+            line(knees[side], ankles[side], body_color)
+    line(rot(shoulders["L"]), rot(shoulders["R"]), body_color)
+    line(rot(shoulders["L"]), hips["L"], body_color)
+    line(rot(shoulders["R"]), hips["R"], body_color)
+    line(hips["L"], hips["R"], body_color)
+    cv2.circle(img, P(pts["headc"]), int(scale * 0.11), body_color, max(2, thick - 1), cv2.LINE_AA)
+    for side in "LR":
+        sh = pts["s" + side]
+        line(sh, pts["e" + side], arm_color, thick + 1)
+        line(pts["e" + side], pts["w" + side], arm_color, thick + 1)
+        cv2.circle(img, P(pts["w" + side]), max(3, int(thick * 0.9)), arm_color, -1, cv2.LINE_AA)
+    return True
+
+
+def draw_pictogram(img, pts, box, legs=False, arm_color=(0, 215, 255),
+                   body_color=(235, 235, 235)):
+    """Clean stick-figure pictogram of a pose, fitted into box=(x0,y0,x1,y1).
+    Arms are drawn in colour so the move reads at a glance. Only the upper
+    body is shown (so it fills the box) unless legs=True."""
+    pts = {k: v for k, v in pts.items() if legs or not ("knee" in k or "ankle" in k)}
+    if len(pts) < 5:
+        return
+    x0, y0, x1, y1 = box
+    sw = (np.linalg.norm(pts["Lshoulder"] - pts["Rshoulder"])
+          if "Lshoulder" in pts and "Rshoulder" in pts else 0.1)
+    head_r = 0.32 * sw
     arr = np.array(list(pts.values()))
     mn, mx = arr.min(0), arr.max(0)
+    mn[1] -= head_r * 1.2  # room for the head circle
     span = np.maximum(mx - mn, 1e-3)
-    scale = 0.85 * min((x1 - x0) / span[0], (y1 - y0) / span[1])
-    mid = np.array([(x0 + x1) / 2, (y0 + y1) / 2])
-    P = {k: (v - (mn + mx) / 2) * scale + mid for k, v in pts.items()}
+    scale = min((x1 - x0) / span[0], (y1 - y0) / span[1])
+    P = {k: (v - (mn + mx) / 2) * scale + np.array([(x0 + x1) / 2, (y0 + y1) / 2])
+         for k, v in pts.items()}
     for a, b in BONES:
         if a in P and b in P:
-            cv2.line(img, ipt(P[a]), ipt(P[b]), color, 2, cv2.LINE_AA)
-    if all(k in P for k in ("head", "Lshoulder", "Rshoulder")):
-        r = max(3, int(np.linalg.norm(P["Lshoulder"] - P["Rshoulder"]) * 0.3))
-        cv2.circle(img, ipt(P["head"]), r, color, 2, cv2.LINE_AA)
+            arm = "elbow" in a + b or "wrist" in a + b
+            cv2.line(img, ipt(P[a]), ipt(P[b]), arm_color if arm else body_color,
+                     4 if arm else 3, cv2.LINE_AA)
+    if "head" in P:
+        cv2.circle(img, ipt(P["head"]), max(4, int(head_r * scale)), body_color, 3,
+                   cv2.LINE_AA)
 
 
 def check_in_frame(pts, vis, cw, h):
@@ -933,54 +1284,95 @@ def check_in_frame(pts, vis, cw, h):
     return 0.10 <= torso <= 0.40 and 0.3 * cw < shoulders[0] < 0.7 * cw
 
 
+def angle_range(history, keys=None):
+    """Mean over joint angles of (max - min) across a list of {name: degrees} dicts."""
+    spans = []
+    for k in (keys or {k for h in history for k in h}):
+        vals = [h[k] for h in history if k in h]
+        if len(vals) >= 3:
+            spans.append(max(vals) - min(vals))
+    return float(np.mean(spans)) if spans else None
+
+
+def still_factor(player_hist, tl, t):
+    """1.0 if you're moving about as much as the dancer was over the last second,
+    down to STILL_FLOOR if the dancer was moving and you were frozen."""
+    lo, hi = tl.index(t - STILL_WINDOW), tl.index(t)
+    if hi - lo < 3 or len(player_hist) < 5:
+        return 1.0
+    seg = tl.angles[lo:hi + 1]
+    seg = seg[:, np.isfinite(seg).sum(axis=0) >= 3]  # angles the dancer actually has here
+    dancer = float((np.nanmax(seg, axis=0) - np.nanmin(seg, axis=0)).mean()) if seg.size else 0.0
+    mine = angle_range(player_hist)
+    if dancer < STILL_DANCER_MIN or mine is None:
+        return 1.0
+    return float(np.clip(STILL_FLOOR + mine / dancer, STILL_FLOOR, 1.0))
+
+
+def shoulder_ratio_of(p, vis):
+    """Shoulder width / torso length of a player's points, None if not all visible."""
+    keys = ("Lshoulder", "Rshoulder", "Lhip", "Rhip")
+    if any(vis[k] < 0.5 for k in keys):
+        return None
+    torso = np.linalg.norm((p["Lshoulder"] + p["Rshoulder"]) / 2 - (p["Lhip"] + p["Rhip"]) / 2)
+    return float(np.linalg.norm(p["Lshoulder"] - p["Rshoulder"]) / torso) if torso > 1e-6 else None
+
+
 class DanceSession:
     """Everything for one song except the webcam, window and audio device."""
 
-    def __init__(self, folder):
+    def __init__(self, folder, title="Dance"):
+        self.folder, self.title, self.multi_song = folder, title, False
         self.tl = Timeline(folder)
         self.video = VideoPanel(os.path.join(folder, "video_720p.mp4"))
-        self.game = DanceGame(self.tl.beats)
+        self.game = DanceGame(self.tl.moves)
         self.rng = np.random.default_rng()
         self.split = 0
-        self.start_run("PLAYER", "medium")
+        self.start_run("PLAYER")
 
-    def start_run(self, player, difficulty):
-        """Fresh score, effects and best-moment photo for this player."""
-        self.player, self.difficulty = player, difficulty
-        self.delay = DIFFICULTY[difficulty]
+    def start_run(self, player):
+        """Fresh score, effects and best-move photo for this player."""
+        self.player = player
         self.game.reset()
         self.pts = self.world = None
-        self.in_frame, self.warmup = False, 0.0
-        self.fx = []
-        self.recent = deque(maxlen=5)   # best moment = best 5-frame average
-        self.best_peak, self.best_frame = -1.0, None
-        self.photo = self.photo_path = self.grade = None
+        self.in_frame = False
+        self.fx, self.pops = [], []
+        self.buf = deque(maxlen=45)     # recent frames: (t, match, shoulder ratio, reach, frame)
+        self.best_peak, self.best_value, self.best_frame = -1.0, 0.0, None
+        self.bonus_seen = -1e9
+        self.angle_hist = deque()       # (t, your joint angles) over the last STILL_WINDOW
+        self.photo = self.photo_path = self.grade = self.rank = None
+        self.board = []
         self.result_t0 = 0.0
 
     def finish(self):
-        """Song over: grade it, stamp and save the best-moment photo."""
+        """Song over: grade it, save the score, stamp and save the best-move photo."""
         g = self.game
         g.done = True
         self.grade = g.grade()
+        self.rank = add_to_board(self.folder, {
+            "name": self.player, "score": g.score, "grade": self.grade[0],
+            "accuracy": round(g.accuracy, 3), "combo": g.best_combo,
+            "date": time.strftime("%Y-%m-%d %H:%M:%S")})
+        self.board = load_board(self.folder)
         if self.best_frame is not None:
             self.photo = photo_card(self.best_frame, self.player, g.score,
-                                    self.grade, self.best_peak)
+                                    self.grade, self.best_value)
             self.photo_path = save_photo(self.photo, self.player)
             print(f"Photo: {self.photo_path or 'could not be saved'}")
         self.result_t0 = time.monotonic()
 
     def render(self, cam, result, t, playing):
         """cam: mirrored webcam frame, result: its PoseLandmarker result,
-        t: song time from the audio clock. Returns the split-screen frame.
+        t: song time from the audio clock. Returns the full game frame: the
+        dancer and you side by side, and the move bar underneath.
 
-        The dancer on the left is live; you are scored against the pose the
-        dancer struck `delay` seconds earlier (tt), best match within +-WINDOW.
+        You are scored against the dancer's pose right now, best match within
+        +-WINDOW of t.
         """
         tl, h = self.tl, PANEL_H
-        tt = t - self.delay
-        i, ti = tl.index(t), tl.index(max(tt, 0.0))
+        i = tl.index(t)
         tracked = bool(tl.tracked[i])
-        target_ok = tt >= 0 and bool(tl.tracked[ti])
         raw = cam
 
         # Left: the dancer, flipped, with the extracted skeleton
@@ -992,10 +1384,11 @@ class DanceSession:
         draw_skeleton(vid, dancer, lambda a, b: (0, 0, 0), 6)
         draw_skeleton(vid, dancer, lambda a, b: line, 3)
 
-        # Right: you
+        # Right: you, each limb coloured by how far it is from the dancer's
         cw = int(h * cam.shape[1] / cam.shape[0])
         cam = cv2.resize(cam, (cw, h))
         player_angles, vis, has_player = {}, {}, bool(result.pose_landmarks)
+        ratio = reach = None
         if has_player:
             lms = result.pose_landmarks[0]
             pts, vis = landmarks_to_points(lms, cw, h)
@@ -1009,6 +1402,7 @@ class DanceSession:
                               for k, v in world.items()}
             player_angles = pose_angles(self.world if SCORE_IN_3D else self.pts, vis)
             self.in_frame = check_in_frame(self.pts, vis, cw, h)
+            ratio, reach = shoulder_ratio_of(self.pts, vis), pose_extent(self.pts)
         else:
             self.pts = self.world = None
             self.in_frame = False
@@ -1017,7 +1411,13 @@ class DanceSession:
         # just isn't scored rather than counting as a miss
         arms_seen = all(k in player_angles for k in REQUIRED)
         live, best_j = ((None, None) if has_player and not arms_seen
-                        else dance_score(player_angles, tl, tt))
+                        else dance_score(player_angles, tl, t))
+        if playing and player_angles:
+            self.angle_hist.append((t, player_angles))
+        while self.angle_hist and self.angle_hist[0][0] < t - STILL_WINDOW:
+            self.angle_hist.popleft()
+        if live is not None and playing:  # standing still doesn't score
+            live *= still_factor([a for _, a in self.angle_hist], tl, t)
 
         if has_player:
             visible = {k: p for k, p in self.pts.items() if vis[k] > 0.5}
@@ -1026,60 +1426,139 @@ class DanceSession:
                 target = tl.angles_at(best_j)
                 errs = {k: abs(v - target[k]) for k, v in player_angles.items()
                         if k in target}
-            ahead = tl.index(tt + LOOKAHEAD)
-            if tt + LOOKAHEAD >= 0 and tl.tracked[ahead]:
-                draw_ghost(cam, fit_ghost(tl.points_at(ahead, vw, h), visible),
-                           NEXT_COLOR, 0.35, 5)
-            if target_ok:
-                draw_ghost(cam, fit_ghost(tl.points_at(ti, vw, h), visible),
-                           GHOST_COLOR, 0.55, 9)
             draw_skeleton(cam, visible, limb_color(errs), 5, head=False)
             for p in visible.values():
                 cv2.circle(cam, ipt(p), 5, (255, 255, 255), -1, cv2.LINE_AA)
 
         if playing:
-            if self.game.update(t, live):
+            self.buf.append((t, live, ratio, reach or 0.0, raw))
+            if self.game.update(t, live, ratio):
                 self._add_fx(t, (cw, h))
-            self._track_best(raw, live, has_player)
-        self.warmup = max(0.0, -tt) if playing else 0.0
+                self._pick_photo()
+            if self.game.bonus_t != self.bonus_seen:  # a bonus tick just landed
+                self.bonus_seen = self.game.bonus_t
+                where = self.pts["head"] if self.pts else np.array([cw / 2, h / 2])
+                self.pops.append({"t": t, "pos": where})
 
         self.fx = [f for f in self.fx if draw_fx(cam, f, t)]
-        self.draw_hints(cam, t, vw)
+        self.pops = [q for q in self.pops if t - q["t"] < 0.7]
+        for q in self.pops:  # "+10" floats up off your head
+            put(cam, f"+{BONUS_POINTS}", (int(q["pos"][0]) + 60, int(q["pos"][1] - 20 - 70 * (t - q["t"]))),
+                0.9, (90, 230, 90), 2, center=True)
 
         self.split = vw
-        canvas = np.hstack([vid, cam])
-        self.draw_hud(canvas, vw, t, live, tracked, has_player)
+        panels = np.hstack([vid, cam])
+        self.draw_hud(panels, vw, t, live, tracked, has_player)
+        canvas = np.vstack([panels, self.draw_bar(panels.shape[1], t)])
         if self.game.done:
             self.draw_result(canvas)
         return canvas
 
-    def draw_hints(self, cam, t, vw):
-        """Corner strip: the poses you will be scored against on the next beats."""
-        tl, g = self.tl, self.game
-        h, w = cam.shape[:2]
-        nxt = g.beats[np.searchsorted(g.beats, t, side="right"):][:HINTS]
-        if not len(nxt):
+    def _pick_photo(self):
+        """A move just landed: keep a frame from it if it's the best move so far.
+
+        The photo comes from the moves themselves, not the whole song, because the
+        best-matching frames overall are usually you and the dancer both standing
+        still. Within the move, prefer the frame where you're best matched and your
+        arms are out (or, for a turn, your shoulders are narrowest)."""
+        g = self.game
+        m, turn = g.last_move
+        lo, hi = ((m - TURN_BEFORE, m + TURN_AFTER) if turn
+                  else (m - MOVE_BEFORE, m + MOVE_AFTER))
+        frames = [e for e in self.buf if lo <= e[0] <= hi and e[2] is not None]
+        if not frames:
             return
-        bw, bh, pad = 100, 140, 8
-        x0, y0 = w - HINTS * (bw + pad) - pad - 10, h - bh - 40
-        shade(cam, x0 - pad, y0 - 28, w - 10 + pad // 2, y0 + bh + 6, 0.6)
-        put(cam, "NEXT", (x0, y0 - 10), 0.5, (200, 200, 200), 1)
-        for k, b in enumerate(nxt):
-            bx = x0 + k * (bw + pad)
-            tp = b - self.delay  # the dancer pose you are rated against on that beat
-            if tp >= 0 and tl.tracked[tl.index(tp)]:
-                v = int(255 * (1 - 0.22 * k))
-                draw_mini(cam, tl.points_at(tl.index(tp), vw, h),
-                          (bx, y0, bx + bw, y0 + bh - 18), (v, v, v))
-            else:
-                put(cam, "?", (bx + bw // 2, y0 + bh // 2 - 10), 1.0, (150, 150, 150),
-                    1, center=True)
-            put(cam, f"{b - t:.1f}s", (bx + bw // 2, y0 + bh - 6), 0.5,
-                (0, 215, 255) if k == 0 else (170, 170, 170), 1, center=True)
+        reach_bonus = lambda e: 0.15 * min(e[3] / 1.5, 1.0)
+        pick = (min(frames, key=lambda e: e[2]) if turn
+                else max(frames, key=lambda e: (e[1] or 0.0) + reach_bonus(e)))
+        value = g.matches[-1]
+        score = value + (0.0 if turn else reach_bonus(pick))
+        if score > self.best_peak:
+            self.best_peak, self.best_value, self.best_frame = score, value, pick[4].copy()
+
+    def draw_bar(self, w, t):
+        """Bottom bar: upcoming key moves scroll left toward the hit zone."""
+        tl, g = self.tl, self.game
+        times = g.move_times
+        bar = np.linspace((34, 26, 26), (16, 12, 12), BAR_H).astype(np.uint8)[:, None, :]
+        bar = np.repeat(bar, w, axis=1)
+        cy, r0 = 86, 54
+        px = (w - HIT_X - 80) / BAR_SECONDS
+        gold = (0, 215, 255)
+
+        nxt = int(np.searchsorted(times, t, side="right"))  # first move still to come
+        dt_next = times[nxt] - t if nxt < len(times) else 1e9
+        pulse = max(0.0, 1 - dt_next / 0.4)
+
+        # Hit zone, lit up as the next move arrives and flashing the rating on landing
+        cv2.line(bar, (HIT_X, 0), (HIT_X, BAR_H - 14), (90, 80, 80), 1, cv2.LINE_AA)
+        age = t - g.rating_t
+        if g.rating and age < MOVE_FEEDBACK:
+            k = 1 - age / MOVE_FEEDBACK
+            color = next(c for n, *_, c in RATINGS if n == g.rating)
+            layer = bar.copy()
+            cv2.circle(layer, (HIT_X, cy), r0 + 14, color, -1, cv2.LINE_AA)
+            cv2.addWeighted(layer, 0.55 * k, bar, 1 - 0.55 * k, 0, bar)
+            pop = 1 + 0.4 * max(0.0, 1 - age / 0.15)
+            put(bar, g.rating, (HIT_X + 190, cy), 1.4 * pop, color, 3, center=True)
+        cv2.circle(bar, (HIT_X, cy), r0 + 14, (255, 255, 255) if pulse < 0.5 else gold,
+                   3 + int(3 * pulse), cv2.LINE_AA)
+
+        lo = int(np.searchsorted(times, t - MOVE_FADE))
+        hi = int(np.searchsorted(times, t + BAR_SECONDS))
+        for idx in range(lo, hi):
+            dt = times[idx] - t
+            x = int(HIT_X + dt * px)
+            alpha = 1.0 if dt >= 0 else max(0.0, 1 + dt / MOVE_FADE)
+            target = bar if alpha >= 1.0 else bar.copy()
+            self._draw_move(target, tl.moves[idx], x, cy, r0, dt, idx == nxt)
+            if alpha < 1.0:
+                cv2.addWeighted(target, alpha, bar, 1 - alpha, 0, bar)
+
+        cv2.rectangle(bar, (10, BAR_H - 10), (w - 10, BAR_H - 4), (60, 55, 55), -1)
+        cv2.rectangle(bar, (10, BAR_H - 10),
+                      (10 + int((w - 20) * min(t / tl.duration, 1.0)), BAR_H - 4), gold, -1)
+        return bar
+
+    def _draw_move(self, bar, mv, x, cy, r0, dt, is_next):
+        gold = (0, 215, 255)
+        cv2.circle(bar, (x, cy), r0, (52, 40, 40), -1, cv2.LINE_AA)
+        cv2.circle(bar, (x, cy), r0, (190, 190, 190), 2, cv2.LINE_AA)
+        box = (x - int(r0 * 0.74), cy - int(r0 * 0.82), x + int(r0 * 0.74), cy + int(r0 * 0.82))
+        if not draw_icon(bar, mv["label"], box):  # a custom label: show the real pose
+            draw_pictogram(bar, mv["pts"], box, legs=False)
+        if mv.get("kind") == "turn":  # a circular arrow around the figure
+            cv2.ellipse(bar, (x, cy), (r0 - 9, r0 - 9), 0, 40, 330, gold, 3, cv2.LINE_AA)
+            a = np.radians(40)
+            tip = np.array([x + (r0 - 9) * np.cos(a), cy + (r0 - 9) * np.sin(a)])
+            for da in (0.55, -0.35):
+                end = tip + 12 * np.array([np.cos(a + np.pi / 2 + da), np.sin(a + np.pi / 2 + da)])
+                cv2.line(bar, ipt(tip), ipt(end), gold, 3, cv2.LINE_AA)
+        if 0 < dt <= APPROACH:  # the ring closes in on the move as it arrives
+            k = dt / APPROACH
+            col = tuple(int(a + (b - a) * (1 - k)) for a, b in zip((130, 130, 130), gold))
+            cv2.circle(bar, (x, cy), int(r0 * (1 + 0.6 * k)), col, 2 + int(2 * (1 - k)),
+                       cv2.LINE_AA)
+        put(bar, mv["label"], (x, cy + r0 + 19), 0.65, (255, 255, 255), 1, center=True)
+
+        if is_next and 0 < dt <= APPROACH:  # 3-2-1, flashing as each second begins
+            n = int(np.ceil(dt))
+            flash = max(0.0, 1 - (n - dt) / 0.45)
+            # The number sits in a badge on the corner so the icon stays readable;
+            # the disc also glows gold for a moment each second
+            if flash > 0:
+                layer = bar.copy()
+                cv2.circle(layer, (x, cy), r0, gold, -1, cv2.LINE_AA)
+                cv2.addWeighted(layer, 0.4 * flash, bar, 1 - 0.4 * flash, 0, bar)
+            bx, by, br = x + int(r0 * 0.8), cy - int(r0 * 0.8), 20 + int(10 * flash)
+            cv2.circle(bar, (bx, by), br, gold, -1, cv2.LINE_AA)
+            cv2.circle(bar, (bx, by), br, (255, 255, 255), 2, cv2.LINE_AA)
+            put(bar, str(n), (bx, by), 1.0 + 0.5 * flash, (30, 20, 20), 3, center=True)
 
     def draw_outline(self, img, ok):
         """'Get in frame' guide on the player panel: green once you fit it."""
         h, w = img.shape[:2]
+        h = PANEL_H
         cx, u = self.split + (w - self.split) // 2, h  # figure in units of panel height
         color = (90, 230, 90) if ok else (90, 90, 255)
         pt = lambda dx, dy: (int(cx + dx * u), int(dy * u))
@@ -1104,133 +1583,211 @@ class DanceSession:
                         "center": center, "angles": self.rng.uniform(0, 2 * np.pi, n),
                         "speeds": self.rng.uniform(250, 520, n)})
 
-    def _track_best(self, raw, live, has_player):
-        if live is None or not has_player:
-            self.recent.clear()
-            return
-        self.recent.append(live)
-        if len(self.recent) == self.recent.maxlen:
-            avg = float(np.mean(self.recent))
-            if avg > self.best_peak:
-                self.best_peak, self.best_frame = avg, raw.copy()
-
     def draw_hud(self, img, split, t, live, tracked, has_player):
         g, h, w = self.game, img.shape[0], img.shape[1]
         cx = split + (w - split) // 2  # centre of the player panel
 
         cv2.line(img, (split, 0), (split, h), (0, 0, 0), 3)
         put(img, "DANCER", (15, 35), 0.8, (0, 215, 255))
-        put(img, f"you copy this {self.delay:g}s later", (15, 65), 0.55,
-            (230, 230, 230), 1)
         if not tracked:
             put(img, "dancer lost - not scored", (15, h - 40), 0.7, (90, 90, 255), 1)
 
         shade(img, split + 10, 10, split + 330, 140)
-        put(img, f"{self.player.upper()}  {self.difficulty.upper()}",
-            (split + 25, 30), 0.6, (200, 200, 200), 1)
+        put(img, self.player.upper(), (split + 25, 30), 0.6, (200, 200, 200), 1)
         put(img, f"SCORE {g.score}", (split + 25, 62), 1.0)
         put(img, f"COMBO x{g.combo}", (split + 25, 92), 0.7, (0, 215, 255))
+        put_right(img, f"BONUS {g.bonus}", split + 315, 92, 0.6, (90, 230, 90), 1)
         m = live or 0.0
         bar(img, split + 25, 106, 290, 22, m,
             score_color(m) if live is not None else (90, 90, 90))
-        put(img, "--" if live is None else f"{int(m * 100)}%", (split + 150, 124), 0.6,
+        tick = split + 25 + int(290 * BONUS_MATCH)  # stay right of this for bonus points
+        cv2.line(img, (tick, 104), (tick, 130), (255, 255, 255), 2)
+        put(img, "--" if live is None else f"{int(m * 100)}%", (split + 70, 124), 0.6,
             (255, 255, 255), 1)
 
         age = t - g.rating_t
-        if g.rating and age < BEAT_FEEDBACK:
+        if g.rating and age < MOVE_FEEDBACK:
             color = next(c for n, *_, c in RATINGS if n == g.rating)
             rx = (split + 340 + w) // 2  # top of the panel, clear of the score box
             pop = 1 + 0.35 * max(0.0, 1 - age / 0.2)  # lands big, settles
             put(img, g.rating, (rx, 55), 1.8 * pop, color, 4, center=True)
             if g.gained:
                 put(img, f"+{g.gained}", (rx, 110), 1.0, color, 2, center=True)
-        if self.warmup > 0:
-            put(img, f"copy the dancer in {self.warmup:.1f}s", (cx, h // 2), 1.0,
-                (0, 215, 255), 2, center=True)
         if not has_player:
             put(img, "Step back so I can see you!", (cx, h - 70), 0.9, (90, 90, 255),
                 center=True)
 
-        bar(img, 10, h - 16, w - 20, 8, t / self.tl.duration, (0, 215, 255))
-
     def draw_result(self, img):
-        g, h, w = self.game, img.shape[0], img.shape[1]
+        g, w = self.game, img.shape[1]
+        h = PANEL_H  # lay out within the two panels; the bar below just goes dark
         letter, gcolor = self.grade
-        shade(img, 0, 0, w, h, 0.88)
-        put(img, "SHOW'S OVER!", (w // 2, 45), 1.6, (0, 215, 255), 3, center=True)
+        gold = (0, 215, 255)
+        shade(img, 0, 0, w, img.shape[0], 0.88)
+        put(img, "SHOW'S OVER!", (w // 2, 40), 1.5, gold, 3, center=True)
+        if self.rank == 1:
+            put(img, "NEW HIGH SCORE!", (w // 2, 80), 0.9, (90, 230, 90), 2, center=True)
 
-        # Left: the best-moment photo
+        # Left: the best-move photo
+        x0, y0, ph = 40, 105, 270
         if self.photo is not None:
-            ph = 320
             pw = int(ph * self.photo.shape[1] / self.photo.shape[0])
-            x0, y0 = (w // 2 - pw) // 2, 80
             img[y0:y0 + ph, x0:x0 + pw] = cv2.resize(self.photo, (pw, ph))
             cv2.rectangle(img, (x0 - 3, y0 - 3), (x0 + pw + 3, y0 + ph + 3),
                           (255, 255, 255), 3)
-            caption = f"saved to {self.photo_path}" if self.photo_path else "best moment"
-            put(img, caption, (w // 4, y0 + ph + 28), 0.6, (200, 200, 200), 1, center=True)
+            caption = f"saved to {self.photo_path}" if self.photo_path else "best move"
+            put(img, caption, (x0 + pw // 2, y0 + ph + 28), 0.55, (200, 200, 200), 1,
+                center=True)
         else:
-            put(img, "No photo - I never saw you!", (w // 4, h // 2), 0.9,
+            pw = int(ph * 16 / 9)
+            put(img, "No photo - I never saw you!", (x0 + pw // 2, h // 2), 0.9,
                 (150, 150, 150), center=True)
 
-        # Right: grade and stats
-        put(img, letter, (w // 2 + 200, 220), 7.0, gcolor, 14, center=True)
-        sx = w // 2 + 400
-        put(img, self.player.upper(), (sx, 120), 1.0, (255, 255, 255))
-        put(img, f"Score  {g.score}", (sx, 175), 1.2, (0, 215, 255))
-        put(img, f"Accuracy  {int(g.accuracy * 100)}%", (sx, 220), 0.9)
-        put(img, f"Best combo  x{g.best_combo}", (sx, 260), 0.9)
+        # Middle: grade and stats
+        mx = x0 + pw + 60
+        put(img, letter, (mx + 75, 235), 6.0, gcolor, 12, center=True)
+        sx = mx + 185
+        put(img, self.title, (sx, 120), 0.55, (200, 200, 200), 1)
+        put(img, self.player.upper(), (sx, 155), 1.0, (255, 255, 255))
+        put(img, f"Score  {g.score}", (sx, 205), 1.2, gold)
+        put(img, f"Move accuracy  {int(g.accuracy * 100)}%", (sx, 245), 0.75)
+        put(img, f"Best combo  x{g.best_combo}", (sx, 280), 0.75)
+        put(img, f"Bonus  {g.bonus}", (sx, 315), 0.75, (90, 230, 90))
         put(img, "  ".join(f"{n} {g.counts[n]}" for n, *_ in RATINGS),
-            (sx, 300), 0.6, (200, 200, 200), 1)
-        put(img, f"{self.difficulty.upper()}  ({self.delay:g}s behind the dancer)",
-            (sx, 335), 0.6, (200, 200, 200), 1)
+            (sx, 355), 0.5, (200, 200, 200), 1)
+
+        # Right: this song's leaderboard, with this run highlighted
+        bx = max(w - 440, sx + 330)
+        draw_board(img, bx, 120, self.board, None if self.rank is None else self.rank - 1,
+                   rows=6, width=min(420, w - bx - 30))
 
         left = max(0, int(np.ceil(RESULT_TIMEOUT - (time.monotonic() - self.result_t0))))
-        put(img, "R  play again        N  new player        Q  quit",
-            (w // 2, h - 75), 1.0, (255, 255, 255), 2, center=True)
-        put(img, f"back to the start screen in {left}s", (w // 2, h - 35), 0.7,
-            (160, 160, 160), 1, center=True)
+        keys = "R  play again        N  new player        "
+        keys += "M  songs        " if self.multi_song else ""
+        put(img, keys + "Q  quit", (w // 2, h - 75), 1.0, (255, 255, 255), 2, center=True)
+        put(img, f"back to the {'song menu' if self.multi_song else 'start screen'} in {left}s",
+            (w // 2, h - 35), 0.7, (160, 160, 160), 1, center=True)
 
-    def render_idle(self, cam, result, name, difficulty, now):
-        """Start screen: type a name, TAB for difficulty, ENTER to dance."""
+    def render_idle(self, cam, result, name, now, can_go_back):
+        """Name screen for the chosen song: type a name, ENTER to dance."""
         h = PANEL_H
         vh, vw_src = self.video.frame.shape[:2]
         vw = int(h * vw_src / vh)
-        cw = int(h * cam.shape[1] / cam.shape[0])
 
         left = np.linspace((60, 25, 30), (25, 10, 15), h).astype(np.uint8)[:, None, :]
         left = np.repeat(left, vw, axis=1)
-        put(left, "POSE PARTY", (vw // 2, 100), 2.4, (0, 215, 255), 5, center=True)
-        put(left, "Copy the dancer. Keep the combo going.", (vw // 2, 160), 0.8,
-            (220, 220, 220), 1, center=True)
-        put(left, "Your name", (vw // 2, 230), 0.7, (180, 180, 180), 1, center=True)
-        cv2.rectangle(left, (vw // 2 - 220, 250), (vw // 2 + 220, 310), (255, 255, 255), 2)
+        put(left, "POSE PARTY", (vw // 2, 90), 2.0, (0, 215, 255), 4, center=True)
+        put(left, self.title, (vw // 2, 150), 0.9, (255, 255, 255), 2, center=True)
+        put(left, "Copy the dancer. Hit the moves.", (vw // 2, 190), 0.65,
+            (200, 200, 200), 1, center=True)
+        put(left, "Your name", (vw // 2, 262), 0.7, (180, 180, 180), 1, center=True)
+        cv2.rectangle(left, (vw // 2 - 200, 282), (vw // 2 + 200, 342), (255, 255, 255), 2)
         cursor = "_" if int(now * 2) % 2 == 0 else " "
-        put(left, (name + cursor) if name else cursor, (vw // 2, 281), 1.1,
+        put(left, (name + cursor) if name else cursor, (vw // 2, 313), 1.1,
             (255, 255, 255), 2, center=True)
-        put(left, f"TAB  difficulty: {difficulty.upper()}", (vw // 2, 365), 0.9,
-            (255, 190, 70), 2, center=True)
-        put(left, f"(you copy the dancer {DIFFICULTY[difficulty]:g}s later)",
-            (vw // 2, 398), 0.6, (200, 200, 200), 1, center=True)
-        put(left, "ENTER  start", (vw // 2, 450), 1.0, (90, 230, 90), 2, center=True)
-        put(left, "ESC  quit", (vw // 2, 492), 0.8, (160, 160, 160), 1, center=True)
-
-        right = cv2.resize(cam, (cw, h))
-        seen = bool(result.pose_landmarks)
-        if seen:
-            pts, vis = landmarks_to_points(result.pose_landmarks[0], cw, h)
-            draw_skeleton(right, {k: p for k, p in pts.items() if vis[k] > 0.5},
-                          lambda a, b: (90, 230, 90), 4)
-        put(right, "I can see you!" if seen else "Step back so I can see you!",
-            (cw // 2, h - 40), 0.9, (90, 230, 90) if seen else (90, 90, 255), center=True)
-        return np.hstack([left, right])
+        put(left, "ENTER  start", (vw // 2, 405), 1.0, (90, 230, 90), 2, center=True)
+        put(left, "ESC  " + ("choose another song" if can_go_back else "quit"),
+            (vw // 2, 450), 0.7, (160, 160, 160), 1, center=True)
+        return stack_with_footer(left, webcam_panel(cam, result), "Moves scroll in from "
+                                 "the right. Match the dancer when one reaches the circle.")
 
 
-def dance_main(folder, camera=0, difficulty="medium"):
+def webcam_panel(cam, result):
+    """Your webcam at panel height, with a skeleton once you're in view."""
+    h = PANEL_H
+    cw = int(h * cam.shape[1] / cam.shape[0])
+    right = cv2.resize(cam, (cw, h))
+    seen = bool(result.pose_landmarks)
+    if seen:
+        pts, vis = landmarks_to_points(result.pose_landmarks[0], cw, h)
+        draw_skeleton(right, {k: p for k, p in pts.items() if vis[k] > 0.5},
+                      lambda a, b: (90, 230, 90), 4)
+    put(right, "I can see you!" if seen else "Step back so I can see you!",
+        (cw // 2, h - 40), 0.9, (90, 230, 90) if seen else (90, 90, 255), center=True)
+    return right
+
+
+def stack_with_footer(left, right, text):
+    """Two panels plus a footer the height of the move bar, so menu screens keep
+    the same overall shape as the game."""
+    panels = np.hstack([left, right])
+    footer = np.zeros((BAR_H, panels.shape[1], 3), np.uint8)
+    footer[:] = (20, 14, 14)
+    put(footer, text, (panels.shape[1] // 2, BAR_H // 2), 0.8, (170, 170, 170), 1,
+        center=True)
+    return np.vstack([panels, footer])
+
+
+# --------------------------------------------------------------------------
+# Song menu
+# --------------------------------------------------------------------------
+SONG_DIR = "output"  # one sub-folder per song, made by extract_dance.py
+MENU_ROWS = 5
+
+
+def find_songs(root):
+    """[{"title", "folder", "seconds"}] for every extracted song under root."""
+    songs = []
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        d = os.path.join(root, name)
+        if not all(os.path.exists(os.path.join(d, f))
+                   for f in ("timeline.npz", "audio.wav", "video_720p.mp4")):
+            continue
+        title = name.replace("_", " ")
+        try:
+            with open(os.path.join(d, "song.json"), encoding="utf-8") as f:
+                title = json.load(f).get("title") or title
+        except (OSError, ValueError):
+            pass
+        with wave.open(os.path.join(d, "audio.wav")) as wf:
+            seconds = wf.getnframes() / wf.getframerate()
+        songs.append({"title": title, "folder": d, "seconds": seconds})
+    return songs
+
+
+def render_menu(songs, sel, board):
+    """Song list on the left, the selected song's leaderboard on the right."""
+    h, vw = PANEL_H, 960
+    left = np.linspace((60, 25, 30), (25, 10, 15), h).astype(np.uint8)[:, None, :]
+    left = np.repeat(left, vw, axis=1)
+    put(left, "POSE PARTY", (vw // 2, 80), 2.2, (0, 215, 255), 4, center=True)
+    put(left, "Choose a song", (vw // 2, 135), 0.8, (220, 220, 220), 1, center=True)
+
+    first = int(np.clip(sel - MENU_ROWS // 2, 0, max(0, len(songs) - MENU_ROWS)))
+    for r, idx in enumerate(range(first, min(len(songs), first + MENU_ROWS))):
+        y = 200 + r * 58
+        song, chosen = songs[idx], idx == sel
+        if chosen:
+            cv2.rectangle(left, (50, y - 26), (vw - 50, y + 26), (80, 55, 40), -1)
+            cv2.rectangle(left, (50, y - 26), (vw - 50, y + 26), (0, 215, 255), 2)
+        color = (255, 255, 255) if chosen else (150, 150, 150)
+        put(left, song["title"][:34], (75, y + 9), 0.8, color, 2 if chosen else 1)
+        mins = f"{int(song['seconds'] // 60)}:{int(song['seconds'] % 60):02d}"
+        put(left, mins, (vw - 130, y + 9), 0.7, color, 1)
+    if len(songs) > MENU_ROWS:
+        put(left, f"{sel + 1} / {len(songs)}", (vw - 110, 135), 0.6, (150, 150, 150), 1,
+            center=True)
+    put(left, "UP / DOWN  choose        ENTER  play        ESC  quit", (vw // 2, h - 40),
+        0.65, (160, 160, 160), 1, center=True)
+
+    right = np.linspace((45, 20, 25), (20, 8, 12), h).astype(np.uint8)[:, None, :]
+    right = np.repeat(right, vw, axis=1)
+    put(right, songs[sel]["title"][:30], (60, 80), 0.9, (255, 255, 255), 2)
+    draw_board(right, 60, 140, board, rows=8, width=vw - 120, scale=0.7)
+    return stack_with_footer(left, right, "Add songs with extract_dance.py: each one gets "
+                             "its own folder in output/")
+
+
+UP_KEYS = {2490368, 65362, 63232, ord("w")}      # arrow codes: Windows, Linux, macOS
+DOWN_KEYS = {2621440, 65364, 63233, ord("s"), 9}  # TAB too
+
+
+def dance_main(folder=None, camera=0, songs_dir=SONG_DIR):
+    songs = ([{"title": "Dance", "folder": folder, "seconds": 0.0}] if folder
+             else find_songs(songs_dir))
+    if not songs:
+        raise SystemExit(f"No songs found in {songs_dir}/. Make one with extract_dance.py.")
     ensure_model()
     landmarker = make_landmarker()
-    session = DanceSession(folder)
-    audio = AudioClock(os.path.join(folder, "audio.wav"))
 
     cap = cv2.VideoCapture(camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -1240,14 +1797,31 @@ def dance_main(folder, camera=0, difficulty="medium"):
 
     window = "Pose Party - Dance"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, 1600, 450)
-    state, name, countdown_t0 = "idle", "", 0.0   # idle -> countdown -> play -> done
-    last_ts = 0
+    cv2.resizeWindow(window, 1600, 620)
+
+    menu = not folder                    # a folder on the command line skips the menu
+    state = "menu" if menu else "load"   # menu -> load -> idle -> countdown -> play -> done
+    sel, name, countdown_t0, last_ts = 0, "", 0.0, 0
+    session = audio = None
+    loaded = board_for = None
+    board = []
+
+    def load_song():
+        nonlocal session, audio, loaded
+        song = songs[sel]
+        if loaded != song["folder"]:
+            if audio:
+                audio.close()
+            session = DanceSession(song["folder"], song["title"])
+            audio = AudioClock(os.path.join(song["folder"], "audio.wav"))
+            loaded = song["folder"]
+        session.multi_song = menu
+        audio.restart()
 
     def begin(player):
         nonlocal state, countdown_t0
         audio.restart()
-        session.start_run(player, difficulty)
+        session.start_run(player)
         state, countdown_t0 = "countdown", time.monotonic()
 
     while True:
@@ -1262,8 +1836,15 @@ def dance_main(folder, camera=0, difficulty="medium"):
                      data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), ts)
         now = time.monotonic()
 
-        if state == "idle":
-            canvas = session.render_idle(frame, result, name, difficulty, now)
+        if state == "load":  # first frame after choosing: load (a second or two)
+            load_song()
+            state = "idle"
+        if state == "menu":
+            if board_for != sel:  # reread the board when you land on a song
+                board, board_for = load_board(songs[sel]["folder"]), sel
+            canvas = render_menu(songs, sel, board)
+        elif state == "idle":
+            canvas = session.render_idle(frame, result, name, now, menu)
         else:
             if state == "play" and audio.finished():
                 session.finish()
@@ -1271,7 +1852,7 @@ def dance_main(folder, camera=0, difficulty="medium"):
             t = min(audio.time(), session.tl.duration - 1e-3)
             canvas = session.render(frame, result, t,
                                     playing=state == "play" and not audio.paused)
-            ch, cw = canvas.shape[:2]
+            ch, cw = PANEL_H, canvas.shape[1]
             px = session.split + (cw - session.split) // 2  # centre of the player panel
             if state == "countdown":
                 # The 3-2-1 only runs while you are in the outline; stepping out resets it
@@ -1293,22 +1874,32 @@ def dance_main(folder, camera=0, difficulty="medium"):
                     center=True)
             if state == "done" and now - session.result_t0 >= RESULT_TIMEOUT:
                 audio.restart()
-                state, name = "idle", ""
+                state, name, board_for = ("menu" if menu else "idle"), "", None
         cv2.imshow(window, canvas)
 
-        key = cv2.waitKey(1) & 0xFF
+        raw = cv2.waitKeyEx(1)
         if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
             break
-        if key == 255:
+        if raw == -1:
             continue
-        if state == "idle":  # letters go into the name, so only ESC quits here
-            if key == 27:
+        key = raw & 0xFF if raw not in UP_KEYS | DOWN_KEYS else raw
+        if state == "menu":
+            if key in UP_KEYS:
+                sel = (sel - 1) % len(songs)
+            elif key in DOWN_KEYS:
+                sel = (sel + 1) % len(songs)
+            elif key in (13, 10):
+                state = "load"
+            elif key in (27, ord("q")):
                 break
-            if key in (13, 10):
+            continue
+        if state == "idle":  # letters go into the name, so only ESC leaves
+            if key == 27:
+                if not menu:
+                    break
+                state, name, board_for = "menu", "", None
+            elif key in (13, 10):
                 begin(name.strip() or "Player")
-            elif key == 9:  # TAB
-                levels = list(DIFFICULTY)
-                difficulty = levels[(levels.index(difficulty) + 1) % len(levels)]
             elif key in (8, 127):
                 name = name[:-1]
             elif 32 <= key < 127 and len(name) < NAME_MAX:
@@ -1323,6 +1914,9 @@ def dance_main(folder, camera=0, difficulty="medium"):
             elif key == ord("n"):
                 audio.restart()
                 state, name = "idle", ""
+            elif key == ord("m") and menu:
+                audio.restart()
+                state, name, board_for = "menu", "", None
         elif key == ord("r"):
             begin(session.player)
         elif key == ord(" "):
@@ -1331,7 +1925,8 @@ def dance_main(folder, camera=0, difficulty="medium"):
             elif state == "countdown":  # skip the in-frame check
                 state, audio.paused = "play", False
 
-    audio.close()
+    if audio:
+        audio.close()
     cap.release()
     landmarker.close()
     cv2.destroyAllWindows()
@@ -1339,16 +1934,21 @@ def dance_main(folder, camera=0, difficulty="medium"):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Pose Party")
-    ap.add_argument("--dance", metavar="FOLDER",
-                    help="dance along to an extract_dance.py output folder")
-    ap.add_argument("--difficulty", choices=list(DIFFICULTY), default="medium",
-                    help="how late you copy the dancer: " +
-                    ", ".join(f"{k} {v:g}s" for k, v in DIFFICULTY.items()))
+    ap.add_argument("--dance", nargs="?", const="", metavar="FOLDER",
+                    help="dance along to a song: with a folder made by extract_dance.py "
+                    "play that song, with nothing open the song menu")
+    ap.add_argument("--songs", default=SONG_DIR, metavar="DIR",
+                    help="where the song menu looks for songs (default: %(default)s)")
+    ap.add_argument("--export-moves", metavar="FOLDER",
+                    help="write a song's automatically picked key moves to moves.json "
+                    "so you can fix labels/times by hand, then exit")
     ap.add_argument("--camera", default="0",
                     help="webcam index (or a video file, for testing)")
     args = ap.parse_args()
-    if args.dance:
-        dance_main(args.dance, int(args.camera) if args.camera.isdigit() else args.camera,
-                   args.difficulty)
+    if args.export_moves:
+        export_moves(args.export_moves)
+    elif args.dance is not None:
+        dance_main(args.dance or None,
+                   int(args.camera) if args.camera.isdigit() else args.camera, args.songs)
     else:
         main()

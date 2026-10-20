@@ -7,13 +7,23 @@ world landmarks, smooths them offline (zero-lag Savitzky-Golay) and flags
 frames where the dancer was lost.
 
 Usage:
-    python extract_dance.py <video> [--start S] [--end E] [--out DIR]
+    python extract_dance.py <video> [--start S] [--end E] [--crop X0,Y0,X1,Y1]
+                            [--title NAME] [--out DIR]
+    python extract_dance.py --batch songs.json [--jobs N]      # several songs at once
 
 Writes to DIR (default: output/<video name>[_S-E]/):
     timeline.npz   timestamps, angles, 3D + 2D joints, tracked/filled flags
     audio.wav      the matching audio, starting at timeline t=0
     preview.mp4    original video with the smoothed skeleton drawn on top
     video_720p.mp4 plain 720p copy of the same span (for pose_party --dance)
+    song.json      title shown in the game's song menu (and how it was cut)
+
+--crop keeps only part of the frame, for everything: pose detection, the 720p
+copy and the preview. Use it on game footage to cut out on-screen UI and the
+game's own move pictograms. Pixels, or fractions of the frame if all <= 1.
+
+--batch takes a JSON file listing several songs (see songs.example.json) and
+extracts them, --jobs at a time in parallel, then prints a summary.
 
 Joint names follow pose_party: "L" = left side of the SCREEN. That lines
 up with a player mirroring the dancer in the game's mirrored webcam view.
@@ -23,11 +33,13 @@ Needs: pip install opencv-python mediapipe numpy scipy imageio-ffmpeg
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 
 import cv2
@@ -89,6 +101,28 @@ def largest_person(result, w, h):
         if area > best_area:
             best, best_area = i, area
     return best
+
+
+def pick_person(result, w, h, prev, follow):
+    """Which detected person to track this frame, as (index, hip centre) or (None, prev).
+
+    With several people in view (two coaches, backdrop silhouettes) "the biggest" can
+    flip between them from frame to frame. So once someone is being followed, stick
+    with whoever is closest to where they were last frame. The first pick is the
+    biggest person, or the leftmost / rightmost one for follow="left" / "right"."""
+    poses = result.pose_landmarks
+    if not poses:
+        return None, prev
+    centres = [np.array([(p[23].x + p[24].x) / 2 * w, (p[23].y + p[24].y) / 2 * h])
+               for p in poses]
+    if prev is not None:
+        k = int(np.argmin([np.linalg.norm(c - prev) for c in centres]))
+    elif follow in ("left", "right"):
+        xs = [c[0] for c in centres]
+        k = int(np.argmin(xs) if follow == "left" else np.argmax(xs))
+    else:
+        k = largest_person(result, w, h)
+    return k, centres[k]
 
 
 def named_joints(img_lms, world_lms, w, h):
@@ -170,7 +204,29 @@ def open_at(video, start):
 # --------------------------------------------------------------------------
 # Pass 1: detection
 # --------------------------------------------------------------------------
-def detect(video, start, end):
+def parse_crop(spec, video):
+    """'x0,y0,x1,y1' (pixels, or fractions of the frame if all <= 1) -> (x, y, w, h)
+    with even sizes, or None."""
+    if not spec:
+        return None
+    cap = cv2.VideoCapture(video)
+    fw, fh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    try:
+        v = [float(a) for a in spec.split(",")]
+        assert len(v) == 4
+    except (ValueError, AssertionError):
+        sys.exit("--crop wants four numbers: X0,Y0,X1,Y1")
+    if max(v) <= 1.0:
+        v = [v[0] * fw, v[1] * fh, v[2] * fw, v[3] * fh]
+    x0, y0, x1, y1 = (int(round(a)) for a in v)
+    x, y, w, h = x0 & ~1, y0 & ~1, (x1 - x0) & ~1, (y1 - y0) & ~1
+    if x < 0 or y < 0 or w < 64 or h < 64 or x + w > fw or y + h > fh:
+        sys.exit(f"--crop {spec} doesn't fit inside the {fw}x{fh} frame")
+    return x, y, w, h
+
+
+def detect(video, start, end, crop=None, follow="largest"):
     ensure_model()
     options = vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -183,6 +239,7 @@ def detect(video, start, end):
     n_est = max(1, int(span * fps))
 
     src_t, p2s, p3s, viss, found = [], [], [], [], []
+    prev, lost = None, 0   # who we're following, and for how many frames we've lost them
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
         while True:
             ok, frame = cap.read()
@@ -191,6 +248,9 @@ def detect(video, start, end):
             t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
             if end is not None and t >= end:
                 break
+            if crop:
+                x, y, cw, ch = crop
+                frame = frame[y:y + ch, x:x + cw]
             h, w = frame.shape[:2]
             i = len(src_t)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -198,7 +258,13 @@ def detect(video, start, end):
                 mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
                 int(round(i * 1000 / fps)))
 
-            k = largest_person(result, w, h)
+            k, centre = pick_person(result, w, h, prev, follow)
+            if k is None:
+                lost += 1
+                if lost > fps:   # gone for a second: pick again from scratch when they return
+                    prev = None
+            else:
+                prev, lost = centre, 0
             if k is None:
                 p2, p3, vis = (np.full((len(JOINTS), d), np.nan) for d in (2, 3, 1))
                 vis = vis[:, 0]
@@ -282,9 +348,10 @@ def extract_audio(ffmpeg, video, start, duration, path):
     subprocess.run(cmd, check=True)
 
 
-def write_video_copy(ffmpeg, video, start, duration, path, height=720):
+def write_video_copy(ffmpeg, video, start, duration, path, height=720, crop=None):
+    vf = (f"crop={crop[2]}:{crop[3]}:{crop[0]}:{crop[1]}," if crop else "") + f"scale=-2:{height}"
     cmd = [ffmpeg, "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-i", video,
-           "-t", f"{duration:.3f}", "-an", "-vf", f"scale=-2:{height}",
+           "-t", f"{duration:.3f}", "-an", "-vf", vf,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
            "-pix_fmt", "yuv420p", path]
     subprocess.run(cmd, check=True)
@@ -301,12 +368,14 @@ def draw_skeleton(img, pts, color, thick):
             cv2.circle(img, tuple(int(v) for v in p), thick + 2, color, -1, cv2.LINE_AA)
 
 
-def write_preview(ffmpeg, video, tl, path):
+def write_preview(ffmpeg, video, tl, path, crop=None):
     start, n, fps = tl["source_t"][0], len(tl["t"]), float(tl["fps"])
     cap, _ = open_at(video, start)
     ok, frame = cap.read()
     if not ok:
         sys.exit("Couldn't re-read video for preview")
+    if crop:
+        frame = frame[crop[1]:crop[1] + crop[3], crop[0]:crop[0] + crop[2]]
     h, w = frame.shape[:2]
     thick = max(2, h // 180)
     cmd = [ffmpeg, "-y", "-loglevel", "error",
@@ -322,6 +391,8 @@ def write_preview(ffmpeg, video, tl, path):
             ok, frame = cap.read()
             if not ok:
                 break
+            if crop:
+                frame = frame[crop[1]:crop[1] + crop[3], crop[0]:crop[0] + crop[2]]
         tracked, filled = tl["tracked"][f], tl["filled"][f]
         color = (90, 230, 90) if tracked else (0, 200, 255) if filled else (90, 90, 255)
         draw_skeleton(frame, tl["image"][f], (0, 0, 0), thick + 3)
@@ -364,22 +435,115 @@ def report(tl, top=5):
               f"  ({b - a} frames)")
 
 
+def default_title(path):
+    """'MovesLikeJagger.mp4' -> 'Moves Like Jagger'; 'my_song-live.mp4' -> 'my song live'."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r"[_\-]+", " ", stem)
+    if " " not in stem.strip():  # CamelCase with no spaces
+        stem = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", stem)
+    return re.sub(r"\s+", " ", stem).strip()
+
+
+def run_batch(manifest, jobs, only=(), skip_existing=False):
+    """Extract every song in a manifest, `jobs` at a time, each in its own process.
+
+    The manifest is a list of songs (or {"defaults": {...}, "songs": [...]}). A song
+    takes the same options as the command line: video, title, start, end, crop, follow, out.
+    Relative video paths are relative to the manifest file. `only` keeps songs whose title
+    contains any of those words; skip_existing leaves out songs already extracted."""
+    with open(manifest, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        defaults, songs = {}, data
+    else:
+        defaults, songs = data.get("defaults", {}), data["songs"]
+    base = os.path.dirname(os.path.abspath(manifest))
+    log_dir = os.path.join("output", "_batch_logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    todo = []
+    for n, entry in enumerate(songs, 1):
+        e = {**defaults, **entry}
+        video = e["video"] if os.path.isabs(e["video"]) else os.path.join(base, e["video"])
+        if not os.path.exists(video):
+            print(f"[{n}/{len(songs)}] SKIPPED, no such file: {video}")
+            continue
+        title = e.get("title") or default_title(video)
+        if only and not any(w.lower() in title.lower() for w in only):
+            continue
+        out = e.get("out") or default_out_dir(video, float(e.get("start", 0)), e.get("end"))
+        if skip_existing and os.path.exists(os.path.join(out, "song.json")):
+            print(f"[{n}/{len(songs)}] already extracted, skipping: {title}")
+            continue
+        cmd = [sys.executable, os.path.abspath(__file__), video]
+        for key in ("start", "end", "crop", "follow", "title", "out"):
+            if e.get(key) is not None:
+                cmd += [f"--{key}", str(e[key])]
+        todo.append((n, title, cmd))
+
+    print(f"Extracting {len(todo)} songs, {jobs} at a time. Logs in {log_dir}/")
+    running, results, t0 = [], [], time.time()
+    while todo or running:
+        while todo and len(running) < jobs:
+            n, title, cmd = todo.pop(0)
+            log_path = os.path.join(log_dir, f"{n:02d}_" + re.sub(r"[^A-Za-z0-9]+", "_", title) + ".log")
+            log = open(log_path, "w", encoding="utf-8")
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+            running.append((title, proc, log, log_path, time.time()))
+            print(f"  started   {title}")
+        time.sleep(2)
+        for item in running[:]:
+            title, proc, log, log_path, started = item
+            if proc.poll() is None:
+                continue
+            running.remove(item)
+            log.close()
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                found = re.search(r"Tracked: ([\d.]+)%", f.read())
+            ok = proc.returncode == 0 and found is not None
+            results.append((title, ok, found.group(1) if found else None))
+            detail = f"{found.group(1)}% tracked" if ok else f"see {log_path}"
+            print(f"  {'done   ' if ok else 'FAILED '}   {title}: {detail}"
+                  f"  ({(time.time() - started) / 60:.0f} min)")
+    print(f"\nFinished {sum(r[1] for r in results)}/{len(results)} in "
+          f"{(time.time() - t0) / 60:.0f} min.")
+    for title, ok, tracked in results:
+        note = "   <- low, check its preview.mp4" if ok and float(tracked) < 90 else ""
+        print(f"  {title:32s} " + (f"{tracked}% tracked{note}" if ok else "FAILED"))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[1])
-    ap.add_argument("video")
+    ap.add_argument("video", nargs="?")
+    ap.add_argument("--batch", metavar="FILE", help="extract every song listed in a JSON file")
+    ap.add_argument("--jobs", type=int, default=2, help="songs to extract at once with --batch")
+    ap.add_argument("--only", nargs="+", metavar="WORD",
+                    help="with --batch, only the songs whose title contains one of these")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="with --batch, skip songs whose output folder already has a song.json")
     ap.add_argument("--start", type=float, default=0.0, help="start time (s)")
     ap.add_argument("--end", type=float, default=None, help="end time (s)")
+    ap.add_argument("--crop", metavar="X0,Y0,X1,Y1",
+                    help="only use this part of the frame (pixels, or fractions)")
+    ap.add_argument("--follow", choices=["largest", "left", "right"], default="largest",
+                    help="with several dancers, who to start on (it then sticks with them)")
+    ap.add_argument("--title", help="name shown in the song menu (default: from the file name)")
     ap.add_argument("--out", help="output folder")
     args = ap.parse_args()
+    if args.batch:
+        return run_batch(args.batch, max(1, args.jobs), args.only or (), args.skip_existing)
+    if not args.video:
+        ap.error("give a video, or --batch FILE")
     if args.end is not None and args.end <= args.start:
         sys.exit("--end must be after --start")
 
     out = args.out or default_out_dir(args.video, args.start, args.end)
     os.makedirs(out, exist_ok=True)
     ffmpeg = find_ffmpeg()
+    crop = parse_crop(args.crop, args.video)
 
     print(f"Detecting poses in {args.video} ...")
-    tl = build_timeline(*detect(args.video, args.start, args.end))
+    tl = build_timeline(*detect(args.video, args.start, args.end, crop, args.follow))
     np.savez_compressed(os.path.join(out, "timeline.npz"), **tl)
 
     print("Extracting audio ...")
@@ -389,12 +553,18 @@ def main():
 
     print("Writing 720p copy ...")
     write_video_copy(ffmpeg, args.video, tl["source_t"][0], duration,
-                     os.path.join(out, "video_720p.mp4"))
+                     os.path.join(out, "video_720p.mp4"), crop=crop)
 
     print("Writing preview ...")
-    write_preview(ffmpeg, args.video, tl, os.path.join(out, "preview.mp4"))
+    write_preview(ffmpeg, args.video, tl, os.path.join(out, "preview.mp4"), crop=crop)
 
-    print(f"Saved timeline.npz, audio.wav, video_720p.mp4, preview.mp4 to {out}")
+    title = args.title or default_title(args.video)
+    with open(os.path.join(out, "song.json"), "w", encoding="utf-8") as f:
+        json.dump({"title": title, "source": os.path.basename(args.video),
+                   "start": args.start, "end": args.end,
+                   "crop": list(crop) if crop else None}, f, indent=2)
+
+    print(f"Saved timeline.npz, audio.wav, video_720p.mp4, preview.mp4, song.json to {out}")
     report(tl)
 
 

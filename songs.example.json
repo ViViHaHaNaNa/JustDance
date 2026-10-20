@@ -1,0 +1,20 @@
+{
+  "defaults": {
+    "crop": "319,29,945,614"
+  },
+  "songs": [
+    {
+      "video": "MovesLikeJagger.mp4",
+      "title": "Moves Like Jagger",
+      "start": 25.9,
+      "end": 230.5,
+      "out": "output/moves_like_jagger"
+    },
+    {
+      "video": "AnotherSong.mp4",
+      "title": "Another Song",
+      "start": 20,
+      "end": 200
+    }
+  ]
+}

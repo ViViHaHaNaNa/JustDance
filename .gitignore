@@ -17,3 +17,6 @@ output/
 
 # Photos of players
 photos/
+
+# Your own batch list (paths on your machine); songs.example.json is the template
+songs.json
